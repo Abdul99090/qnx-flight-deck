@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 DONE_MARKER = "FDTEST DONE"
 FDTEST_RE = re.compile(r"^FDTEST\s+(\S+)\s+(PASS|FAIL)\s*(.*)$")
 DONE_RE = re.compile(r"^FDTEST DONE pass=(\d+) fail=(\d+)")
@@ -110,6 +110,13 @@ class WatchdogEvent:
 
 
 @dataclass
+class AttemptRecord:
+    attempt: int
+    outcome: str  # done | silent | timeout | ended | exited
+    seconds: float
+
+
+@dataclass
 class Report:
     tool: str = f"qnx-flight-deck {TOOL_VERSION}"
     run_name: str = ""
@@ -121,7 +128,10 @@ class Report:
     boot_seconds: float | None = None
     tests: list[TestResult] = field(default_factory=list)
     crashes: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
     done_counts: dict | None = None
+    attempts: list[AttemptRecord] = field(default_factory=list)
+    failure_summary: str = ""
     watchdog_events: list[WatchdogEvent] = field(default_factory=list)
     console_log: str = ""
     verdict: str = "ERROR"
@@ -138,7 +148,10 @@ class Report:
             "boot_seconds": self.boot_seconds,
             "tests": [vars(t) for t in self.tests],
             "crashes": self.crashes,
+            "problems": self.problems,
             "done_counts": self.done_counts,
+            "attempts": [vars(a) for a in self.attempts],
+            "failure_summary": self.failure_summary,
             "summary": {
                 "pass": sum(1 for t in self.tests if t.ok),
                 "fail": sum(1 for t in self.tests if not t.ok),
@@ -234,7 +247,15 @@ def qemu_command(args, image: Path, serial_path: Path) -> tuple[list[str], dict]
 def boot_once(args, image: Path, serial_path: Path,
               report: Report, boot_t0: float) -> str:
     """Run one QEMU boot. Returns "done" (FDTEST DONE seen), "silent"
-    (watchdog: target produced output, then went quiet), or "timeout"."""
+    (watchdog: test session started, then went quiet), "ended" (boot
+    script finished without DONE), "exited" (QEMU died on its own), or
+    "timeout" (boot deadline hit).
+
+    Boot and test phases have separate failure handling: before
+    FDTEST START the only deadline is the overall timeout (a slow
+    boot is not a hang); the silence watchdog arms only once the
+    test session has started producing progress output.
+    """
     if serial_path.exists():
         serial_path.unlink()
     serial_path.touch()
@@ -246,7 +267,7 @@ def boot_once(args, image: Path, serial_path: Path,
     run_t0 = time.monotonic()
     last_size = 0
     last_output_at = time.monotonic()
-    saw_output = False
+    saw_start = False
     done_at: float | None = None
     try:
         while time.monotonic() - run_t0 < args.timeout:
@@ -258,8 +279,9 @@ def boot_once(args, image: Path, serial_path: Path,
             if size != last_size:
                 last_size = size
                 last_output_at = time.monotonic()
-                saw_output = True
                 text = serial_path.read_text(errors="replace")
+                if "FDTEST START" in text:
+                    saw_start = True
                 if report.boot_seconds is None and "FDTEST START" in text:
                     report.boot_seconds = round(time.monotonic() - boot_t0, 2)
                 if done_at is None and DONE_MARKER in text:
@@ -275,7 +297,11 @@ def boot_once(args, image: Path, serial_path: Path,
                 # reporting a child that died right at the end) time to
                 # reach the console before we call it done.
                 return "done"
-            if (args.watchdog and saw_output
+            if proc.poll() is not None:
+                # QEMU exited on its own (e.g. guest reboot under
+                # -no-reboot): distinct from a harness timeout.
+                return "done" if done_at is not None else "exited"
+            if (args.watchdog and saw_start
                     and time.monotonic() - last_output_at > args.watchdog_silence):
                 return "silent"
         return "done" if done_at is not None else "timeout"
@@ -303,7 +329,11 @@ def phase_boot_and_harvest(args, image: Path, workdir: Path,
     while True:
         attempt += 1
         serial_path = workdir / f"console-attempt-{attempt}.log"
+        a_t0 = time.monotonic()
         outcome = boot_once(args, image, serial_path, report, boot_t0)
+        report.attempts.append(AttemptRecord(
+            attempt=attempt, outcome=outcome,
+            seconds=round(time.monotonic() - a_t0, 2)))
         if serial_path.exists():
             chunks.append(f"===== boot attempt {attempt} =====\n"
                           + serial_path.read_text(errors="replace"))
@@ -325,29 +355,35 @@ def parse_console(serial_path: Path) -> list[TestResult]:
     return parse_session(serial_path)[0]
 
 
-def parse_session(serial_path: Path) -> tuple[list[TestResult], dict | None, list[str]]:
+def parse_session(serial_path: Path) -> tuple[list[TestResult], dict | None, list[str], list[str]]:
     """Parse the LAST test session in the log (earlier sessions belong
     to watchdog-restarted attempts).
 
-    Returns (tests, done_counts, crashes): the FDTEST results, the
-    pass/fail counts the target itself declared on its FDTEST DONE
-    line (None when absent), and any FDCRASH lines the on-target
-    supervisor reported.
+    Returns (tests, done_counts, crashes, problems): the FDTEST
+    results, the pass/fail counts the target itself declared on its
+    FDTEST DONE line (None when absent), any FDCRASH lines the
+    on-target supervisor reported, and session-integrity problems —
+    duplicate test records and malformed FDTEST lines. A session with
+    problems is never the basis for a PASS: the DONE tally alone
+    cannot distinguish "test B passed" from "test A reported twice".
     """
     tests: list[TestResult] = []
     done_counts: dict | None = None
     crashes: list[str] = []
+    problems: list[str] = []
     if not serial_path.exists():
-        return tests, done_counts, crashes
+        return tests, done_counts, crashes, problems
     lines = serial_path.read_text(errors="replace").splitlines()
     start = 0
     for i, line in enumerate(lines):
         if "FDTEST START" in line:
             start = i
+    seen: dict[str, int] = {}
     for line in lines[start:]:
         s = line.strip()
         m = FDTEST_RE.match(s)
         if m and m.group(1) not in ("DONE", "START"):
+            seen[m.group(1)] = seen.get(m.group(1), 0) + 1
             tests.append(TestResult(m.group(1), m.group(2) == "PASS", m.group(3).strip()))
             continue
         d = DONE_RE.match(s)
@@ -357,7 +393,13 @@ def parse_session(serial_path: Path) -> tuple[list[TestResult], dict | None, lis
         c = FDCRASH_RE.match(s)
         if c:
             crashes.append(c.group(1).strip())
-    return tests, done_counts, crashes
+            continue
+        if s.startswith("FDTEST") and "FDTEST START" not in s:
+            problems.append(f"malformed FDTEST record: {s[:80]}")
+    for name, n in seen.items():
+        if n > 1:
+            problems.append(f"duplicate test record: {name} reported {n}x")
+    return tests, done_counts, crashes, problems
 
 
 # --------------------------------------------------------------------------
@@ -380,20 +422,53 @@ def cmd_run(args) -> int:
 
     done = phase_boot_and_harvest(args, image, workdir, report)
     serial_path = workdir / "console.log"
-    report.tests, report.done_counts, report.crashes = parse_session(serial_path)
+    (report.tests, report.done_counts,
+     report.crashes, report.problems) = parse_session(serial_path)
     report.console_log = str(serial_path)
     passed = sum(1 for t in report.tests if t.ok)
     failed = sum(1 for t in report.tests if not t.ok)
     counts_match = report.done_counts == {"pass": passed, "fail": failed}
     # A PASS must be trustworthy: the target reached DONE, every parsed
     # check passed, the target's own DONE tallies match what we parsed
-    # (nothing lost or spoofed in between), and no supervised process
-    # crashed during the session.
+    # (nothing lost or spoofed in between), the session is free of
+    # duplicate/malformed records, and no supervised process crashed
+    # during the session.
     report.verdict = "PASS" if (
         done and failed == 0 and passed > 0 and counts_match
-        and not report.crashes
+        and not report.crashes and not report.problems
     ) else "FAIL"
     return finish(args, report, workdir)
+
+
+def build_failure_summary(report: Report) -> str:
+    """One-line diagnosis across all boot attempts: why this run did
+    not pass, correlating attempt outcomes, watchdog restarts, test
+    results, crash records and session-integrity problems."""
+    reasons: list[str] = []
+    if report.build and not report.build.ok:
+        reasons.append("build failed")
+    elif report.image and not report.image.ok:
+        reasons.append("image build failed")
+    if report.attempts and report.attempts[-1].outcome != "done":
+        reasons.append(f"final boot attempt ended '{report.attempts[-1].outcome}'")
+    if report.watchdog_events:
+        reasons.append(f"watchdog restarts: {len(report.watchdog_events)}")
+    failed = [t.name for t in report.tests if not t.ok]
+    if failed:
+        reasons.append("failed tests: " + ", ".join(failed))
+    for c in report.crashes:
+        reasons.append(f"crash: {c}")
+    passed = sum(1 for t in report.tests if t.ok)
+    if report.done_counts is not None and report.tests:
+        if report.done_counts != {"pass": passed, "fail": len(failed)}:
+            reasons.append(
+                f"DONE tallies mismatch (target pass={report.done_counts['pass']} "
+                f"fail={report.done_counts['fail']}; parsed pass={passed} "
+                f"fail={len(failed)})")
+    reasons.extend(report.problems)
+    if not reasons:
+        reasons.append("no passing test session recorded")
+    return "; ".join(reasons)
 
 
 def finish(args, report: Report, workdir: Path) -> int:
@@ -401,6 +476,8 @@ def finish(args, report: Report, workdir: Path) -> int:
         report.verdict = "BUILD-FAILED"
     if report.image and not report.image.ok and report.verdict == "ERROR":
         report.verdict = "IMAGE-FAILED"
+    if report.verdict != "PASS" and not report.failure_summary:
+        report.failure_summary = build_failure_summary(report)
     out = workdir / "report.json"
     out.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
     print(f"== QNX Flight-Deck :: {report.run_name} ==")
@@ -416,6 +493,10 @@ def finish(args, report: Report, workdir: Path) -> int:
         print(f"  crash : {c}")
     for e in report.watchdog_events:
         print(f"  watch : restart #{e.restart_no} at {e.at_seconds:.0f}s ({e.reason})")
+    for p in report.problems:
+        print(f"  integ : {p}")
+    if report.failure_summary:
+        print(f"  why   : {report.failure_summary}")
     print(f"  VERDICT: {report.verdict}")
     print(f"  report : {out}")
     return 0 if report.verdict == "PASS" else 1

@@ -65,12 +65,19 @@ as a test runner:
    `FDTEST DONE`); `fdsup` adds `FDCRASH` lines for faulted children.
    Flight-Deck parses the console stream live.
 6. **Verdict** — PASS only if the target reached `FDTEST DONE`, every
-   parsed check passed, the DONE tallies match the parsed results, and
-   no crash was recorded. Anything else — build error, boot timeout,
-   hang, failing check, segfault — is a FAIL with the evidence attached.
-7. **Watchdog** *(optional)* — with `--watchdog`, a target that goes
-   silent after producing output is restarted up to `--max-restarts`
-   times; each restart is recorded in `report.json`.
+   parsed check passed, the DONE tallies match the parsed results, the
+   session is free of duplicate or malformed result records, and no
+   crash was recorded. Anything else — build error, boot timeout,
+   hang, failing check, segfault — is a FAIL with the evidence
+   attached, plus a one-line `failure_summary` correlating the boot
+   attempts, watchdog restarts, test results and crash records.
+7. **Watchdog** *(optional)* — with `--watchdog`, a target whose test
+   session goes silent is restarted up to `--max-restarts` times;
+   each restart is recorded in `report.json`. The silence watchdog
+   arms only after `FDTEST START`: before that, the boot is governed
+   by the overall timeout alone, so a slow boot is never mistaken
+   for a hang. Every boot attempt (outcome + duration) is recorded
+   in the report's `attempts` timeline.
 
 ## On-target test agent
 
@@ -150,7 +157,7 @@ Exit code is `0` on PASS, `1` otherwise — drop it straight into CI.
 
 ```json
 {
-  "tool": "qnx-flight-deck 0.1.0",
+  "tool": "qnx-flight-deck 0.3.0",
   "run_name": "fdtest",
   "started_at": "2026-11-16T05:14:00+07:00",
   "target": "qemu-x86_64",
@@ -163,7 +170,10 @@ Exit code is `0` on PASS, `1` otherwise — drop it straight into CI.
     {"name": "sched", "ok": true, "detail": "wake_order=2,1,0"}
   ],
   "crashes": [],
+  "problems": [],
   "done_counts": {"pass": 3, "fail": 0},
+  "attempts": [{"attempt": 1, "outcome": "done", "seconds": 21.4}],
+  "failure_summary": "",
   "summary": {"pass": 3, "fail": 0},
   "watchdog_events": [],
   "console_log": "runs/fdtest-.../console.log",
@@ -190,7 +200,9 @@ runs/                      per-run artifacts: report.json + console logs
 
 - Timer drift budgets are set for QEMU/TCG emulation; on real QNX
   hardware the same checks are typically three orders of magnitude
-  tighter. The measured values are always in the report.
+  tighter. The measured values are always in the report. Treat the
+  budget as a TCG tolerance, not as evidence of hardware timing
+  quality.
 - Target binaries are linked statically so the minimal boot image needs
   no loader setup; the harness keeps the image small and the boot fast.
 - The serial console is the only channel: deliberately. It works on any

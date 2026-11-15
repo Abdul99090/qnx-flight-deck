@@ -7,7 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "flightdeck"))
 
-from flightdeck import parse_console, parse_session, Report, TestResult, WatchdogEvent  # noqa: E402
+from flightdeck import (  # noqa: E402
+    parse_console, parse_session, build_failure_summary,
+    Report, TestResult, WatchdogEvent, AttemptRecord,
+)
 
 
 def write_log(tmp: Path, text: str) -> Path:
@@ -56,10 +59,11 @@ def test_parse_session_done_counts_and_crash(tmp: Path):
         "FDTEST pre-crash PASS note=about-to-fault",
         "FDCRASH child=/proc/boot/fdcrash signal=11 signame=SIGSEGV",
     ]))
-    tests, done_counts, crashes = parse_session(log)
+    tests, done_counts, crashes, problems = parse_session(log)
     assert len(tests) == 1 and tests[0].ok
     assert done_counts is None
     assert crashes == ["child=/proc/boot/fdcrash signal=11 signame=SIGSEGV"]
+    assert problems == []
 
 
 def test_parse_session_done_counts(tmp: Path):
@@ -68,9 +72,46 @@ def test_parse_session_done_counts(tmp: Path):
         "FDTEST ipc PASS rtt_us=1",
         "FDTEST DONE pass=1 fail=0",
     ]))
-    tests, done_counts, crashes = parse_session(log)
+    tests, done_counts, crashes, problems = parse_session(log)
     assert done_counts == {"pass": 1, "fail": 0}
     assert crashes == []
+    assert problems == []
+
+
+def test_parse_session_duplicate_records_flagged(tmp: Path):
+    # A duplicated PASS must not be able to stand in for a lost record:
+    # the DONE tally (pass=2) matches the parsed counts, so only the
+    # duplicate check can catch this.
+    log = write_log(tmp, "\n".join([
+        "FDTEST START sysname=QNX",
+        "FDTEST ipc PASS rtt_us=1",
+        "FDTEST ipc PASS rtt_us=2",
+        "FDTEST DONE pass=2 fail=0",
+    ]))
+    tests, done_counts, crashes, problems = parse_session(log)
+    assert len(tests) == 2
+    assert any("duplicate" in p and "ipc" in p for p in problems)
+
+
+def test_parse_session_malformed_records_flagged(tmp: Path):
+    log = write_log(tmp, "\n".join([
+        "FDTEST START sysname=QNX",
+        "FDTEST ipc PASS rtt_us=1",
+        "FDTEST timer PAS",  # truncated on the wire
+        "FDTEST DONE pass=1 fail=0",
+    ]))
+    tests, done_counts, crashes, problems = parse_session(log)
+    assert [t.name for t in tests] == ["ipc"]
+    assert any("malformed" in p for p in problems)
+
+
+def test_failure_summary_crash_and_attempt(_tmp: Path):
+    r = Report(run_name="demo")
+    r.attempts = [AttemptRecord(1, "ended", 3.5)]
+    r.tests = [TestResult("pre-crash", True, "")]
+    r.crashes = ["child=/proc/boot/fdcrash signal=11 signame=SIGSEGV"]
+    s = build_failure_summary(r)
+    assert "ended" in s and "SIGSEGV" in s
 
 
 def test_report_shape():
@@ -81,6 +122,9 @@ def test_report_shape():
     assert d["summary"] == {"pass": 1, "fail": 1}
     assert d["watchdog_events"][0]["restart_no"] == 1
     assert d["run_name"] == "demo"
+    assert d["attempts"] == []
+    assert d["problems"] == []
+    assert d["failure_summary"] == ""
 
 
 if __name__ == "__main__":
