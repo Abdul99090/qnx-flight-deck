@@ -1,0 +1,18 @@
+[virtual=x86_64,multiboot] .bootstrap = {
+  startup-x86 -D 8250.3f8.115200
+  PATH=/proc/boot LD_LIBRARY_PATH=/proc/boot procnto-smp-instr
+}
+[+script] .script = {
+  procmgr_symlink ../../proc/boot/libc.so /usr/lib/ldqnx-64.so.2
+  devc-ser8250 -e -b115200 3f8,4 &
+  waitfor /dev/ser1 5
+  reopen /dev/ser1
+  display_msg FDSCRIPT START
+  /proc/boot/fdtest
+  display_msg FDSCRIPT END
+}
+libc.so
+libc.so.6
+libgcc_s.so.1
+devc-ser8250
+fdtest={BIN_PATH}
