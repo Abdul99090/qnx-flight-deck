@@ -112,9 +112,14 @@ static void test_timer(void) {
     long drift_us = elapsed_us - 50000L;
     if (drift_us < 0) drift_us = -drift_us;
     /* QEMU/TCG timing is loose (pure emulation on a shared host);
-     * budget 60 ms drift for the emulation profile. On real QNX
-     * hardware this is typically three orders of magnitude tighter. */
-    int ok = drift_us <= 60000L;
+     * budget 60 ms drift for the emulation profile by default,
+     * overridable at build time with -DFD_TIMER_BUDGET_US=<us>.
+     * On real QNX hardware this is typically three orders of
+     * magnitude tighter. */
+#ifndef FD_TIMER_BUDGET_US
+#define FD_TIMER_BUDGET_US 60000L
+#endif
+    int ok = drift_us <= FD_TIMER_BUDGET_US;
     snprintf(detail, sizeof(detail), "slept_us=%ld drift_us=%ld", elapsed_us, drift_us);
     report("timer", ok, detail);
 }
@@ -162,6 +167,7 @@ static void test_sched(void) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* never lose results to buffering */
     printf("FDTEST START sysname=QNX\n");
     fflush(stdout);
     test_ipc();

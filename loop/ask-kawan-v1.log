@@ -1,1 +1,7 @@
 gpt-6.1-sol: OK (510 token out)
+gpt-6-astra: attempt 1 gagal (rc=1), retry...
+gpt-6-astra: attempt 2 gagal (rc=1), retry...
+gpt-6-astra: GAGAL sesudah 2 attempt — unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.xingchiapi.com/v1/responses, request id: f5e939c51d6aac0343a79850912be7dd
+ringkasan: /home/hatch/workspace/tools/ask-kawan/runs/kawan-20261116-051651-summary.json
+  OK: gpt-6.1-sol
+  GAGAL: gpt-6-astra — unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.xingchiapi.com/v1/responses, request id: f5e939c51d6aac0343a79850912be7dd

@@ -24,6 +24,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -36,10 +37,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.2.0"
 DONE_MARKER = "FDTEST DONE"
 FDTEST_RE = re.compile(r"^FDTEST\s+(\S+)\s+(PASS|FAIL)\s*(.*)$")
 DONE_RE = re.compile(r"^FDTEST DONE pass=(\d+) fail=(\d+)")
+FDCRASH_RE = re.compile(r"^FDCRASH\s+(.*)$")
+
+# The QEMU child currently running, so a killed harness never orphans it.
+_ACTIVE_PROC: subprocess.Popen | None = None
+
+
+def _kill_active() -> None:
+    global _ACTIVE_PROC
+    if _ACTIVE_PROC is not None and _ACTIVE_PROC.poll() is None:
+        _ACTIVE_PROC.kill()
+    _ACTIVE_PROC = None
+
+
+atexit.register(_kill_active)
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +120,8 @@ class Report:
     image: PhaseResult | None = None
     boot_seconds: float | None = None
     tests: list[TestResult] = field(default_factory=list)
+    crashes: list[str] = field(default_factory=list)
+    done_counts: dict | None = None
     watchdog_events: list[WatchdogEvent] = field(default_factory=list)
     console_log: str = ""
     verdict: str = "ERROR"
@@ -120,6 +137,8 @@ class Report:
             "image": vars(self.image) if self.image else None,
             "boot_seconds": self.boot_seconds,
             "tests": [vars(t) for t in self.tests],
+            "crashes": self.crashes,
+            "done_counts": self.done_counts,
             "summary": {
                 "pass": sum(1 for t in self.tests if t.ok),
                 "fail": sum(1 for t in self.tests if not t.ok),
@@ -149,9 +168,24 @@ def phase_build(args, env: dict, workdir: Path) -> tuple[PhaseResult, Path | Non
 
 
 def phase_image(args, env: dict, workdir: Path, binary: Path) -> tuple[PhaseResult, Path | None]:
-    """Render the mkifs buildfile from its template and build the image."""
+    """Render the mkifs buildfile from its template and build the image.
+
+    If the template references {SUP_PATH}, the on-target supervisor
+    (fdsup.c, next to the template by default) is compiled first.
+    """
     t0 = time.monotonic()
     tmpl = Path(args.buildfile_template).read_text()
+    if "{SUP_PATH}" in tmpl:
+        sup_src = Path(args.supervisor_source) if args.supervisor_source else \
+            Path(args.buildfile_template).resolve().parent / "fdsup.c"
+        sup_bin = workdir / "fdsup"
+        rc, out = run_cmd(
+            ["qcc", "-V", "gcc_ntox86_64", "-static", "-O2",
+             "-o", str(sup_bin), str(sup_src)], env=env)
+        if rc != 0:
+            return PhaseResult(False, time.monotonic() - t0,
+                               "supervisor build failed: " + out.strip()[-1000:]), None
+        tmpl = tmpl.replace("{SUP_PATH}", str(sup_bin))
     buildfile = workdir / (args.name + ".build")
     buildfile.write_text(
         tmpl.replace("{BIN_PATH}", str(binary)).replace("{BIN_NAME}", args.name)
@@ -207,10 +241,13 @@ def boot_once(args, image: Path, serial_path: Path,
     cmd, env = qemu_command(args, image, serial_path)
     proc = subprocess.Popen(cmd, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    global _ACTIVE_PROC
+    _ACTIVE_PROC = proc
     run_t0 = time.monotonic()
     last_size = 0
     last_output_at = time.monotonic()
     saw_output = False
+    done_at: float | None = None
     try:
         while time.monotonic() - run_t0 < args.timeout:
             time.sleep(0.25)
@@ -225,12 +262,23 @@ def boot_once(args, image: Path, serial_path: Path,
                 text = serial_path.read_text(errors="replace")
                 if report.boot_seconds is None and "FDTEST START" in text:
                     report.boot_seconds = round(time.monotonic() - boot_t0, 2)
-                if DONE_MARKER in text:
-                    return "done"
+                if done_at is None and DONE_MARKER in text:
+                    done_at = time.monotonic()
+                if done_at is None and "FDSCRIPT END" in text:
+                    # The boot script finished without the target ever
+                    # reporting DONE (e.g. it crashed under the
+                    # supervisor): the session is over, don't burn the
+                    # whole timeout waiting.
+                    return "ended"
+            if done_at is not None and time.monotonic() - done_at > 1.5:
+                # Grace window: give a late crash line (e.g. a supervisor
+                # reporting a child that died right at the end) time to
+                # reach the console before we call it done.
+                return "done"
             if (args.watchdog and saw_output
                     and time.monotonic() - last_output_at > args.watchdog_silence):
                 return "silent"
-        return "timeout"
+        return "done" if done_at is not None else "timeout"
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
@@ -238,6 +286,7 @@ def boot_once(args, image: Path, serial_path: Path,
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        _ACTIVE_PROC = None
 
 
 def phase_boot_and_harvest(args, image: Path, workdir: Path,
@@ -273,21 +322,42 @@ def phase_boot_and_harvest(args, image: Path, workdir: Path,
 
 
 def parse_console(serial_path: Path) -> list[TestResult]:
-    """Parse FDTEST lines from the LAST test session in the log (earlier
-    sessions belong to watchdog-restarted attempts)."""
+    return parse_session(serial_path)[0]
+
+
+def parse_session(serial_path: Path) -> tuple[list[TestResult], dict | None, list[str]]:
+    """Parse the LAST test session in the log (earlier sessions belong
+    to watchdog-restarted attempts).
+
+    Returns (tests, done_counts, crashes): the FDTEST results, the
+    pass/fail counts the target itself declared on its FDTEST DONE
+    line (None when absent), and any FDCRASH lines the on-target
+    supervisor reported.
+    """
     tests: list[TestResult] = []
+    done_counts: dict | None = None
+    crashes: list[str] = []
     if not serial_path.exists():
-        return tests
+        return tests, done_counts, crashes
     lines = serial_path.read_text(errors="replace").splitlines()
     start = 0
     for i, line in enumerate(lines):
         if "FDTEST START" in line:
             start = i
     for line in lines[start:]:
-        m = FDTEST_RE.match(line.strip())
+        s = line.strip()
+        m = FDTEST_RE.match(s)
         if m and m.group(1) not in ("DONE", "START"):
             tests.append(TestResult(m.group(1), m.group(2) == "PASS", m.group(3).strip()))
-    return tests
+            continue
+        d = DONE_RE.match(s)
+        if d:
+            done_counts = {"pass": int(d.group(1)), "fail": int(d.group(2))}
+            continue
+        c = FDCRASH_RE.match(s)
+        if c:
+            crashes.append(c.group(1).strip())
+    return tests, done_counts, crashes
 
 
 # --------------------------------------------------------------------------
@@ -310,11 +380,19 @@ def cmd_run(args) -> int:
 
     done = phase_boot_and_harvest(args, image, workdir, report)
     serial_path = workdir / "console.log"
-    report.tests = parse_console(serial_path)
+    report.tests, report.done_counts, report.crashes = parse_session(serial_path)
     report.console_log = str(serial_path)
     passed = sum(1 for t in report.tests if t.ok)
     failed = sum(1 for t in report.tests if not t.ok)
-    report.verdict = "PASS" if (done and failed == 0 and passed > 0) else "FAIL"
+    counts_match = report.done_counts == {"pass": passed, "fail": failed}
+    # A PASS must be trustworthy: the target reached DONE, every parsed
+    # check passed, the target's own DONE tallies match what we parsed
+    # (nothing lost or spoofed in between), and no supervised process
+    # crashed during the session.
+    report.verdict = "PASS" if (
+        done and failed == 0 and passed > 0 and counts_match
+        and not report.crashes
+    ) else "FAIL"
     return finish(args, report, workdir)
 
 
@@ -334,6 +412,8 @@ def finish(args, report: Report, workdir: Path) -> int:
         print(f"  boot  : target reached tests in {report.boot_seconds:.1f}s")
     for t in report.tests:
         print(f"  test  : {t.name:<8} {'PASS' if t.ok else 'FAIL'}  {t.detail}")
+    for c in report.crashes:
+        print(f"  crash : {c}")
     for e in report.watchdog_events:
         print(f"  watch : restart #{e.restart_no} at {e.at_seconds:.0f}s ({e.reason})")
     print(f"  VERDICT: {report.verdict}")
@@ -342,6 +422,11 @@ def finish(args, report: Report, workdir: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    def _on_signal(signum, _frame):
+        _kill_active()
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     p = argparse.ArgumentParser(prog="flightdeck", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -356,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--static", action="store_true", default=True,
                    help="link the target statically (default)")
     r.add_argument("--qcc-flags", default="", help="extra qcc flags, space-separated")
+    r.add_argument("--supervisor-source", default="",
+                   help="fdsup.c path (default: next to the buildfile template)")
     r.add_argument("--qemu-root", default=os.environ.get("FD_QEMU_ROOT", ""),
                    help="user-level QEMU tree (usr/bin/qemu-system-x86_64 inside); "
                         "empty = use system qemu")

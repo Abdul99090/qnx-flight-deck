@@ -25,17 +25,29 @@ $ ./flightdeck/flightdeck.py run \
 ```
 
 Every run leaves a `report.json`: build/image results, boot latency, each
-test's outcome and measurements, watchdog events, and the final verdict —
-ready for CI gating, dashboards, or an AI agent to consume.
+test's outcome and measurements, **harvested crash records**, watchdog
+events, and the final verdict — ready for CI gating, dashboards, or an AI
+agent to consume.
 
 ## Why
 
 Embedded CI is painful: cross-compile, hand-assemble a boot image, boot a
 board or emulator, squint at a serial console, and *hope* someone notices
-when a test didn't run. Flight-Deck treats the target like an aircraft:
-nothing counts unless the flight recorder says so. If the target hangs,
-the watchdog restarts it — and the restart is in the report, not lost in
-someone's scrollback.
+when a test didn't run. Worse, on a minimal QNX image a process that dies
+from a signal leaves **no trace at all** on the console — the boot script
+simply continues, and a "successful" run can hide a segfault.
+
+Flight-Deck treats the target like an aircraft: nothing counts unless
+the flight recorder says so. It is a fault-diagnostics harness as much
+as a test runner:
+
+- a test only counts when the target's own `FDTEST DONE` tallies match
+  what the harness parsed — nothing lost, nothing spoofed;
+- an on-target supervisor (`fdsup`) records *exactly* how each test
+  process died — exit code, signal number and name, or timeout — and
+  the harness files it in the report as a crash record;
+- if the whole target hangs, the host watchdog restarts the VM — and
+  the restart is in the report, not lost in someone's scrollback.
 
 ## How it works
 
@@ -44,13 +56,19 @@ someone's scrollback.
    bootable multiboot image.
 3. **Boot** — launches the image in QEMU (x86_64) with the serial console
    captured to a file. No network stack is needed on the target.
-4. **Harvest** — an on-target agent prints machine-readable result lines
-   (`FDTEST <name> PASS|FAIL key=value ...`, terminated by `FDTEST DONE`);
+4. **Supervise** — test programs run under `fdsup`, an on-target
+   supervisor that waits on each child with a deadline and prints
+   exactly how it ended: clean exit, exit code, **signal (crash)**, or
+   timeout. A crashed process can no longer die silently.
+5. **Harvest** — the on-target agent prints machine-readable result
+   lines (`FDTEST <name> PASS|FAIL key=value ...`, terminated by
+   `FDTEST DONE`); `fdsup` adds `FDCRASH` lines for faulted children.
    Flight-Deck parses the console stream live.
-5. **Verdict** — PASS only if the target actually reached `FDTEST DONE`
-   with zero failures. Anything else — build error, boot timeout, hang,
-   failing check — is a FAIL with the evidence attached.
-6. **Watchdog** *(optional)* — with `--watchdog`, a target that goes
+6. **Verdict** — PASS only if the target reached `FDTEST DONE`, every
+   parsed check passed, the DONE tallies match the parsed results, and
+   no crash was recorded. Anything else — build error, boot timeout,
+   hang, failing check, segfault — is a FAIL with the evidence attached.
+7. **Watchdog** *(optional)* — with `--watchdog`, a target that goes
    silent after producing output is restarted up to `--max-restarts`
    times; each restart is recorded in `report.json`.
 
@@ -68,6 +86,16 @@ someone's scrollback.
 it wedges after three heartbeats (a runaway real-time thread); built
 normally it completes cleanly. The same harness run passes one and
 fails — with restart events — the other.
+
+`target/fdcrash.c` is the crash demo: it prints one passing check and
+then deliberately segfaults. `fdsup` catches the death and the harness
+fails the run with the evidence in the report:
+
+```
+  test  : pre-crash PASS  note=about-to-fault
+  crash : child=/proc/boot/fdcrash signal=11 signame=SIGSEGV
+  VERDICT: FAIL
+```
 
 ## Requirements
 
@@ -108,6 +136,12 @@ fails — with restart events — the other.
     --qcc-flags=-DFD_HANG_AFTER=3 \
     --qemu-root "$FD_QEMU_ROOT" \
     --watchdog --watchdog-silence 6 --max-restarts 2
+
+# Crash demo — target segfaults under the supervisor (expect FAIL + crash record)
+./flightdeck/flightdeck.py run --name fdcrash \
+    --source target/fdcrash.c \
+    --buildfile-template target/fdcrash.build.tmpl \
+    --qemu-root "$FD_QEMU_ROOT"
 ```
 
 Exit code is `0` on PASS, `1` otherwise — drop it straight into CI.
@@ -128,6 +162,8 @@ Exit code is `0` on PASS, `1` otherwise — drop it straight into CI.
     {"name": "timer", "ok": true, "detail": "slept_us=69961 drift_us=19961"},
     {"name": "sched", "ok": true, "detail": "wake_order=2,1,0"}
   ],
+  "crashes": [],
+  "done_counts": {"pass": 3, "fail": 0},
   "summary": {"pass": 3, "fail": 0},
   "watchdog_events": [],
   "console_log": "runs/fdtest-.../console.log",
@@ -139,10 +175,13 @@ Exit code is `0` on PASS, `1` otherwise — drop it straight into CI.
 
 ```
 flightdeck/flightdeck.py   the harness (single file, stdlib only)
+target/fdsup.c             on-target supervisor (crash/timeout recorder)
 target/fdtest.c            on-target self-test agent (native QNX IPC/timer/sched)
 target/fdtest.build.tmpl   mkifs buildfile template for the self-test image
 target/fdwatch.c           watchdog demo target (healthy / hanging builds)
 target/fdwatch.build.tmpl  buildfile template for the watchdog image
+target/fdcrash.c           crash-harvest demo target (deliberate SIGSEGV)
+target/fdcrash.build.tmpl  buildfile template for the crash image
 tests/test_flightdeck.py   host-side unit tests (no QNX/QEMU required)
 runs/                      per-run artifacts: report.json + console logs
 ```
@@ -156,6 +195,9 @@ runs/                      per-run artifacts: report.json + console logs
   no loader setup; the harness keeps the image small and the boot fast.
 - The serial console is the only channel: deliberately. It works on any
   QNX target with a UART, including boards with no network.
+- Roadmap: streaming `slog2` (via `slogger2`/`slog2info`) into the
+  report for kernel-level fault context, and `dumper` core-file
+  harvesting on targets with a filesystem.
 
 ## License
 

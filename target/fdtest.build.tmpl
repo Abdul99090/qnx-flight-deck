@@ -8,11 +8,12 @@
   waitfor /dev/ser1 5
   reopen /dev/ser1
   display_msg FDSCRIPT START
-  /proc/boot/fdtest
+  /proc/boot/fdsup 30 /proc/boot/fdtest
   display_msg FDSCRIPT END
 }
 libc.so
 libc.so.6
 libgcc_s.so.1
 devc-ser8250
+fdsup={SUP_PATH}
 fdtest={BIN_PATH}

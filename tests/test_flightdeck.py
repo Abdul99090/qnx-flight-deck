@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "flightdeck"))
 
-from flightdeck import parse_console, Report, TestResult, WatchdogEvent  # noqa: E402
+from flightdeck import parse_console, parse_session, Report, TestResult, WatchdogEvent  # noqa: E402
 
 
 def write_log(tmp: Path, text: str) -> Path:
@@ -48,6 +48,29 @@ def test_parse_uses_last_session_after_watchdog_restart(tmp: Path):
 
 def test_parse_missing_file(tmp: Path):
     assert parse_console(tmp / "nope.log") == []
+
+
+def test_parse_session_done_counts_and_crash(tmp: Path):
+    log = write_log(tmp, "\n".join([
+        "FDTEST START sysname=QNX",
+        "FDTEST pre-crash PASS note=about-to-fault",
+        "FDCRASH child=/proc/boot/fdcrash signal=11 signame=SIGSEGV",
+    ]))
+    tests, done_counts, crashes = parse_session(log)
+    assert len(tests) == 1 and tests[0].ok
+    assert done_counts is None
+    assert crashes == ["child=/proc/boot/fdcrash signal=11 signame=SIGSEGV"]
+
+
+def test_parse_session_done_counts(tmp: Path):
+    log = write_log(tmp, "\n".join([
+        "FDTEST START sysname=QNX",
+        "FDTEST ipc PASS rtt_us=1",
+        "FDTEST DONE pass=1 fail=0",
+    ]))
+    tests, done_counts, crashes = parse_session(log)
+    assert done_counts == {"pass": 1, "fail": 0}
+    assert crashes == []
 
 
 def test_report_shape():

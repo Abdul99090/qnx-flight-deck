@@ -1,0 +1,15 @@
+[virtual=x86_64,multiboot] .bootstrap = {
+  startup-x86 -D 8250.3f8.115200
+  PATH=/proc/boot LD_LIBRARY_PATH=/proc/boot procnto-smp-instr
+}
+[+script] .script = {
+  procmgr_symlink ../../proc/boot/libc.so /usr/lib/ldqnx-64.so.2
+  display_msg FDSCRIPT START
+  /proc/boot/fdsup 30 /proc/boot/fdcrash
+  display_msg FDSCRIPT END
+}
+libc.so
+libc.so.6
+libgcc_s.so.1
+fdsup={SUP_PATH}
+fdcrash={BIN_PATH}

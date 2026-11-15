@@ -18,6 +18,7 @@
 #include <sys/neutrino.h>
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("FDTEST START sysname=QNX\n");
     fflush(stdout);
     int beat = 0;
