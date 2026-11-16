@@ -3,3 +3,4 @@ __pycache__/
 *.ifs
 target/fdtest
 target/fdwatch
+target/*.build

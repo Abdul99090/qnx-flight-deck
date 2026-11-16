@@ -25,7 +25,8 @@ $ ./flightdeck/flightdeck.py run \
 ```
 
 Every run leaves a `report.json`: build/image results, boot latency, each
-test's outcome and measurements, **harvested crash records**, watchdog
+test's outcome and measurements, **harvested crash records** (how each
+supervised process ended: exit code, signal, or timeout), watchdog
 events, and the final verdict — ready for CI gating, dashboards, or an AI
 agent to consume.
 
@@ -42,7 +43,8 @@ the flight recorder says so. It is a fault-diagnostics harness as much
 as a test runner:
 
 - a test only counts when the target's own `FDTEST DONE` tallies match
-  what the harness parsed — nothing lost, nothing spoofed;
+  what the harness parsed — a record dropped or garbled on the console
+  breaks the match and fails the run;
 - an on-target supervisor (`fdsup`) records *exactly* how each test
   process died — exit code, signal number and name, or timeout — and
   the harness files it in the report as a crash record;
@@ -64,8 +66,9 @@ as a test runner:
    lines (`FDTEST <name> PASS|FAIL key=value ...`, terminated by
    `FDTEST DONE`); `fdsup` adds `FDCRASH` lines for faulted children.
    Flight-Deck parses the console stream live.
-6. **Verdict** — PASS only if the target reached `FDTEST DONE`, every
-   parsed check passed, the DONE tallies match the parsed results, the
+6. **Verdict** — PASS only if the target reached `FDTEST DONE`, at
+   least one check ran and passed, every parsed check passed, the DONE
+   tallies match the parsed results, the
    session is free of duplicate or malformed result records, and no
    crash was recorded. Anything else — build error, boot timeout,
    hang, failing check, segfault — is a FAIL with the evidence
@@ -77,7 +80,9 @@ as a test runner:
    arms only after `FDTEST START`: before that, the boot is governed
    by the overall timeout alone, so a slow boot is never mistaken
    for a hang. Every boot attempt (outcome + duration) is recorded
-   in the report's `attempts` timeline.
+   in the report's `attempts` timeline. If a restarted attempt then
+   completes cleanly, the run can still PASS — every restart remains
+   visible in `watchdog_events` and `attempts`.
 
 ## On-target test agent
 
@@ -198,15 +203,22 @@ runs/                      per-run artifacts: report.json + console logs
 
 ## Notes & limitations
 
-- Timer drift budgets are set for QEMU/TCG emulation; on real QNX
-  hardware the same checks are typically three orders of magnitude
-  tighter. The measured values are always in the report. Treat the
-  budget as a TCG tolerance, not as evidence of hardware timing
-  quality.
-- Target binaries are linked statically so the minimal boot image needs
-  no loader setup; the harness keeps the image small and the boot fast.
-- The serial console is the only channel: deliberately. It works on any
-  QNX target with a UART, including boards with no network.
+- Timer drift budgets are set for QEMU/TCG emulation. On real QNX
+  hardware a sleep's overshoot is bounded by the kernel clock tick
+  (1 ms by default) and system load, so drift is far smaller than
+  under TCG — but we publish no hardware ratio we have not measured.
+  The measured values are always in the report. Treat the budget as
+  a TCG tolerance, not as evidence of hardware timing quality.
+- The demo target binaries are linked statically — a deliberate choice
+  so the minimal boot image needs no loader setup for them; the
+  harness keeps the image small and the boot fast.
+- The serial console is the only channel: deliberately. The protocol
+  needs nothing but a UART, so it is designed to adapt to any QNX
+  target with a serial console, including boards with no network.
+  This release's build/boot/restart machinery targets QEMU x86_64:
+  a physical board also needs its BSP image, and a board reset needs
+  a reset path — the host watchdog restarts a VM; it cannot
+  power-cycle hardware over a passive serial line.
 - Roadmap: streaming `slog2` (via `slogger2`/`slog2info`) into the
   report for kernel-level fault context, and `dumper` core-file
   harvesting on targets with a filesystem.

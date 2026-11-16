@@ -430,7 +430,7 @@ def cmd_run(args) -> int:
     counts_match = report.done_counts == {"pass": passed, "fail": failed}
     # A PASS must be trustworthy: the target reached DONE, every parsed
     # check passed, the target's own DONE tallies match what we parsed
-    # (nothing lost or spoofed in between), the session is free of
+    # (a dropped or garbled record breaks the match), the session is free of
     # duplicate/malformed records, and no supervised process crashed
     # during the session.
     report.verdict = "PASS" if (
