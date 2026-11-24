@@ -125,6 +125,35 @@ fails the run with the evidence in the report:
 > `qemu64` model doesn't expose it and the QNX bootstrap then hangs
 > silently before printing anything.
 
+## Build & Run
+
+**Toolchain:** QNX SDP 8.0 — target programs are compiled with `qcc`
+(the QNX C/C++ compiler front-end) and boot images are assembled with
+`mkifs`. **Target:** QEMU x86_64 (`qemu-system-x86_64`, booted with
+`-cpu max`; see the QEMU note under Requirements). The harness itself
+is host-side Python 3 (standard library only) and drives the whole
+pipeline:
+
+1. **Build** — `qcc` compiles the on-target program (e.g.
+   `target/fdtest.c`) against QNX SDP 8.0.
+2. **Image** — `mkifs` renders the buildfile template into a bootable
+   multiboot image (`.ifs`).
+3. **Run** — QEMU boots the image with the serial console captured to
+   a file; Flight-Deck parses the console stream live and writes
+   `report.json` with the verdict (exit code `0` on PASS, `1`
+   otherwise).
+
+```bash
+# Point the harness at your QNX SDP 8.0 install and QEMU tree
+export QNX_SDP_DIR=~/qnx/qnx800        # or pass --sdp
+export FD_QEMU_ROOT=/path/to/qemu-root # or use a system QEMU install
+
+./flightdeck/flightdeck.py run --name fdtest \
+    --source target/fdtest.c \
+    --buildfile-template target/fdtest.build.tmpl \
+    --qemu-root "$FD_QEMU_ROOT"
+```
+
 ## Quick start
 
 ```bash
